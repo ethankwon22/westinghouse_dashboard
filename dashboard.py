@@ -36,15 +36,27 @@ DECOM_PER_MW     = 1_000_000
 SECURITY_COST_RANGE = {"low": 50_000, "mid": 275_000, "high": 600_000}
 
 # Generator efficiency (fuel $/kWh-thermal → $/kWh-electric)
-DIESEL_EFFICIENCY   = 0.35
-NATGAS_EFFICIENCY   = 0.30
+DIESEL_EFFICIENCY = 0.35
+NATGAS_EFFICIENCY = 0.30
+
+# ─────────────────────────────────────────
+# Constants — Market WTP Framework
+# ─────────────────────────────────────────
+PQ_MULT = {"Low": 1.00, "Med": 1.15, "High": 1.35}
+EO_MULT = {"Low": 1.00, "Med": 1.25, "High": 1.60}
+CU_MULT = {"Low": 1.00, "Med": 1.10, "High": 1.25}
+
+RESTART_COST_PER_KW = {
+    "Residential": 1.0,
+    "Commercial":  3.0,
+    "Industrial":  10.0,
+}
 
 # ─────────────────────────────────────────
 # Load Real EIA Data
 # ─────────────────────────────────────────
 @st.cache_data
 def load_fuel_prices():
-    """Load EIA SEDS forecasted fuel prices (1970–2038) by sector."""
     path = "Backup_Generator_Fuel_Prices_Forecasted.xlsx"
     if not os.path.exists(path):
         path = "/mnt/user-data/uploads/Backup_Generator_Fuel_Prices_Forecasted.xlsx"
@@ -55,31 +67,31 @@ def load_fuel_prices():
 
 @st.cache_data
 def load_reliability():
-    """Load EIA-861 SAIDI reliability data by state (2024)."""
     path = "Reliability_2024.xlsx"
     if not os.path.exists(path):
         path = "/mnt/user-data/uploads/Reliability_2024.xlsx"
     df = pd.read_excel(path, sheet_name="State Totals", header=None)
-    # Rows 0-2 = multi-row header, rows 3+ = data
-    # Use iloc to extract columns directly — avoids duplicate column name issues
-    # Col 1 = State abbr, Col 3 = SAIDI With MED (min/yr), Col 6 = SAIDI Without MED (min/yr)
+
     raw = df.iloc[3:].copy()
-    raw = raw.dropna(subset=[1])  # drop footer rows
+    raw = raw.dropna(subset=[1])
 
     result = pd.DataFrame({
-        "state":               raw.iloc[:, 1].astype(str).str.strip(),
-        "saidi_with_med":      pd.to_numeric(raw.iloc[:, 3], errors="coerce"),
-        "saidi_without_med":   pd.to_numeric(raw.iloc[:, 6], errors="coerce"),
+        "state":             raw.iloc[:, 1].astype(str).str.strip(),
+        "saidi_with_med":    pd.to_numeric(raw.iloc[:, 3], errors="coerce"),
+        "saidi_without_med": pd.to_numeric(raw.iloc[:, 6], errors="coerce"),
+        "saifi_with_med":    pd.to_numeric(raw.iloc[:, 4], errors="coerce"),
+        "saifi_without_med": pd.to_numeric(raw.iloc[:, 7], errors="coerce"),
     })
     result["saidi_hours_with_med"]    = result["saidi_with_med"] / 60
     result["saidi_hours_without_med"] = result["saidi_without_med"] / 60
-    return result[["state", "saidi_hours_with_med", "saidi_hours_without_med"]].reset_index(drop=True)
+    return result[["state",
+                    "saidi_hours_with_med", "saidi_hours_without_med",
+                    "saifi_with_med",       "saifi_without_med"]].reset_index(drop=True)
 
-fuel_sheets   = load_fuel_prices()
-reliability   = load_reliability()
+fuel_sheets = load_fuel_prices()
+reliability = load_reliability()
 
 def get_price(sector, state, fuel, year):
-    """Get $/kWh price for a given sector/state/fuel/year."""
     df = fuel_sheets[sector]
     row = df[(df["State"] == state) & (df["Fuel Type"].str.contains(fuel, case=False))]
     if row.empty:
@@ -88,7 +100,6 @@ def get_price(sector, state, fuel, year):
     return float(row[col].values[0]) if col in row.columns else None
 
 def get_state_full_names():
-    """Map state abbreviations to full names for display."""
     STATE_MAP = {
         "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California",
         "CO":"Colorado","CT":"Connecticut","DC":"District of Columbia","DE":"Delaware",
@@ -124,52 +135,95 @@ st.caption("eVinci Pricing Framework — Government (FBCF-based) & Market (EIA R
 # Sidebar
 # ─────────────────────────────────────────
 st.sidebar.header("Scenario Inputs")
-industry    = st.sidebar.selectbox("Industry Type", ["Government", "Market"])
-required_mw = st.sidebar.number_input("Required Capacity (MW)", 1, 15, 5, step=1,
-                                       help="eVinci range: 1–15 MW")
+industry = st.sidebar.selectbox("Industry Type", ["Government", "Market"])
+required_mw = st.sidebar.number_input(
+    "Required Capacity (MW)", 1, 15, 5, step=1,
+    help="Default = 5 MW. eVinci range: 1–15 MW."
+)
 
-# ── Government Parameters ─────────────────
 if industry == "Government":
     st.sidebar.markdown("---")
     st.sidebar.markdown("**🪖 Government Parameters**")
     mission_type = st.sidebar.selectbox(
         "Mission Type", list(FBCF_PER_CONVOY_FIXED.keys()), index=1,
-        help="Remote FOB: $500K/convoy | Forward: $150K/convoy | Domestic: $30K/convoy")
+        help="Default = Forward Operating. Remote FOB: $500K/convoy | Forward: $150K/convoy | Domestic: $30K/convoy"
+    )
     deployment_region = st.sidebar.selectbox(
         "Deployment Region", list(REGION_DISTANCE_KM.keys()), index=0,
-        help="Geographic context — does not directly affect cost")
+        help="Default = Middle East. Geographic context only — does not directly affect cost."
+    )
     force_size = st.sidebar.slider("Force Size (personnel)", 100, 5000, 500, step=100)
-    convoys_per_year = st.sidebar.slider("Convoys per Year", 4, 200, 24, step=4,
-        help="Default 24 = monthly resupply + surge (RAND MG-662 baseline)")
-    security_level   = st.sidebar.slider("Security Level (%)", 0, 100, 30)
-    risk_tolerance   = st.sidebar.slider("Risk Tolerance (%)", 0, 100, 50)
-    operation_years  = st.sidebar.slider("Operation Duration (years)", 3, 20, 10)
-    contract_type    = st.sidebar.selectbox("Contract Type (LCOE Stage)",
+    convoys_per_year = st.sidebar.slider(
+        "Convoys per Year", 4, 200, 24, step=4,
+        help="Default = 24. Interpreted as monthly resupply + surge."
+    )
+    security_level = st.sidebar.slider("Security Level (%)", 0, 100, 30)
+    risk_tolerance = st.sidebar.slider("Risk Tolerance (%)", 0, 100, 50)
+    operation_years = st.sidebar.slider("Operation Duration (years)", 3, 20, 10)
+    contract_type = st.sidebar.selectbox(
+        "Contract Type (LCOE Stage)",
         list(CAPEX_PER_MW.keys()), index=1,
-        help="FOAK=$20M/MW | BOAK=$12M/MW | NOAK=$7M/MW")
+        help="Default = BOAK. FOAK=$20M/MW | BOAK=$12M/MW | NOAK=$7M/MW"
+    )
 
-# ── Market Parameters ─────────────────────
 else:
     st.sidebar.markdown("---")
     st.sidebar.markdown("**⚡ Market Parameters**")
 
-    selected_state_name = st.sidebar.selectbox("State", STATE_NAMES,
-        index=STATE_NAMES.index("California") if "California" in STATE_NAMES else 0)
+    selected_state_name = st.sidebar.selectbox(
+        "State", STATE_NAMES,
+        index=STATE_NAMES.index("California") if "California" in STATE_NAMES else 0
+    )
     selected_state_abbr = {v: k for k, v in STATE_MAP.items()}[selected_state_name]
 
-    sector       = st.sidebar.selectbox("Sector", ["Commercial", "Industrial", "Residential"],
-                                        help="Determines energy price tier from EIA SEDS data")
-    forecast_year = st.sidebar.slider("Forecast Year", 2024, 2038, 2025,
-                                      help="2024 = historical. 2025–2038 = Prophet forecast.")
-    saidi_variant = st.sidebar.selectbox("SAIDI Variant",
+    sector = st.sidebar.selectbox(
+        "Sector", ["Commercial", "Industrial", "Residential"],
+        index=0,
+        help="Default = Commercial. Determines energy price tier from EIA SEDS data."
+    )
+    forecast_year = st.sidebar.slider(
+        "Forecast Year", 2024, 2038, 2025,
+        help="Default = 2025. 2024 = historical. 2025–2038 = forecast."
+    )
+    saidi_variant = st.sidebar.selectbox(
+        "SAIDI Variant",
         ["With Major Event Days", "Without Major Event Days"],
-        help="With MED includes hurricanes/storms. Without MED = typical baseline.")
-    facility_kw  = st.sidebar.number_input("Facility Demand (kW)", 100, 50000, 1000, step=100,
-                                            help="Average electrical power draw of the facility")
-    revenue_per_hr = st.sidebar.number_input("Revenue Lost per Outage Hour ($)", 0, 5_000_000,
-                                              50_000, step=5_000,
-                                              help="Gross productivity/revenue loss per hour of outage")
-    risk_tolerance = st.sidebar.slider("Risk Tolerance (%)", 0, 100, 50)
+        help="Default = With Major Event Days."
+    )
+    facility_kw = st.sidebar.number_input(
+        "Facility Demand (kW)", 100, 50000, 1000, step=100,
+        help="Default = 1,000 kW."
+    )
+    revenue_per_hr = st.sidebar.number_input(
+        "Revenue Lost per Outage Hour ($)", 0, 5_000_000, 50_000, step=5_000,
+        help=(
+            "Default = $50,000/hr. This is a user-adjustable placeholder, "
+            "not a model-predicted value."
+        )
+    )
+    risk_tolerance = st.sidebar.slider(
+        "Risk Tolerance (%)", 0, 100, 50,
+        help="Default = 50%."
+    )
+
+    with st.sidebar.expander("⚙️ Advanced Risk Scenarios", expanded=False):
+        st.caption(
+            "Defaults are preloaded for convenience. If unchanged, Low is used as the default scenario. "
+            "Multipliers are conservative scenario calibrations anchored in public literature "
+            "(EPRI, NREL, LBNL, DOE) — not direct published coefficients."
+        )
+        pq_level = st.selectbox(
+            "Power Quality Sensitivity",
+            ["Low", "Med", "High"], index=0
+        )
+        eo_level = st.selectbox(
+            "Extended Outage Exposure",
+            ["Low", "Med", "High"], index=0
+        )
+        cu_level = st.selectbox(
+            "Capacity Urgency",
+            ["Low", "Med", "High"], index=0
+        )
 
 # ─────────────────────────────────────────
 # Government Model Calculation
@@ -186,9 +240,13 @@ def calc_government(required_mw, mission_type, deployment_region,
     logistics_ratio     = LOGISTICS_RATIO_MIN + (LOGISTICS_RATIO_MAX - LOGISTICS_RATIO_MIN) * (1 - risk_tolerance / 100)
     force_realloc       = force_size * logistics_ratio * SOLDIER_ANNUAL_COST
 
-    if security_level <= 30:   sec_rate = SECURITY_COST_RANGE["low"]
-    elif security_level <= 70: sec_rate = SECURITY_COST_RANGE["mid"]
-    else:                      sec_rate = SECURITY_COST_RANGE["high"]
+    if security_level <= 30:
+        sec_rate = SECURITY_COST_RANGE["low"]
+    elif security_level <= 70:
+        sec_rate = SECURITY_COST_RANGE["mid"]
+    else:
+        sec_rate = SECURITY_COST_RANGE["high"]
+
     security_cost_annual = sec_rate * required_mw
 
     capex       = CAPEX_PER_MW[contract_type] * required_mw
@@ -203,8 +261,10 @@ def calc_government(required_mw, mission_type, deployment_region,
     max_price_kwh = (diesel_annual + custom_total) / annual_kwh if annual_kwh > 0 else 0
 
     return {
-        "diesel_annual": diesel_annual, "smr_annual": smr_annual,
-        "net_advantage": net_advantage, "max_smr_price_kwh": max_price_kwh,
+        "diesel_annual": diesel_annual,
+        "smr_annual": smr_annual,
+        "net_advantage": net_advantage,
+        "max_smr_price_kwh": max_price_kwh,
         "breakdown": {
             "FBCF (Fuel Logistics)":     fbcf_annual,
             "Casualty Avoidance":        blood_cost_annual,
@@ -221,121 +281,117 @@ def calc_government(required_mw, mission_type, deployment_region,
     }
 
 # ─────────────────────────────────────────
-# Market Model Calculation (Real EIA Data)
+# Market Model Calculation
 # ─────────────────────────────────────────
 def calc_market(required_mw, state_abbr, sector, forecast_year,
                 saidi_variant, facility_kw, revenue_per_hr,
-                risk_tolerance, custom_items):
+                risk_tolerance, pq_level, eo_level, cu_level, custom_items):
 
-    # Real prices from EIA SEDS
-    elec_price   = get_price(sector, STATE_MAP[state_abbr], "Electricity", forecast_year)
-    diesel_price = get_price(sector, STATE_MAP[state_abbr], "Diesel",      forecast_year)
-    natgas_price = get_price(sector, STATE_MAP[state_abbr], "Natural Gas",  forecast_year)
+    fallback_flags = []
 
-    # Real SAIDI from EIA-861
+    # Real prices
+    elec_price = get_price(sector, STATE_MAP[state_abbr], "Electricity", forecast_year)
+    diesel_price = get_price(sector, STATE_MAP[state_abbr], "Diesel", forecast_year)
+    natgas_price = get_price(sector, STATE_MAP[state_abbr], "Natural Gas", forecast_year)
+
+    if elec_price is None:
+        elec_price = 0.10
+        fallback_flags.append("Electricity price fallback applied ($0.10/kWh).")
+    if diesel_price is None:
+        diesel_price = 0.07
+        fallback_flags.append("Diesel backup price fallback applied ($0.07/kWh-th).")
+    if natgas_price is None:
+        natgas_price = 0.04
+        fallback_flags.append("Natural gas backup price fallback applied ($0.04/kWh-th).")
+
+    # Reliability
     rel_row = reliability[reliability["state"] == state_abbr]
     if rel_row.empty:
         saidi_hours = 2.0
+        saifi = 1.5
+        fallback_flags.append("Reliability fallback applied (SAIDI=2.0 hrs/yr, SAIFI=1.5 events/yr).")
     else:
-        col = "saidi_hours_with_med" if "With Major" in saidi_variant else "saidi_hours_without_med"
-        saidi_hours = float(rel_row[col].values[0])
+        saidi_col = "saidi_hours_with_med" if "With Major" in saidi_variant else "saidi_hours_without_med"
+        saifi_col = "saifi_with_med" if "With Major" in saidi_variant else "saifi_without_med"
+        saidi_hours = float(rel_row[saidi_col].values[0])
+        saifi = float(rel_row[saifi_col].values[0])
 
-    # Grid savings during outage (utility doesn't bill)
-    grid_savings = facility_kw * saidi_hours * (elec_price or 0.10)
+    base_duration_loss = revenue_per_hr * saidi_hours
+    restart_cost = RESTART_COST_PER_KW[sector]
+    v_freq = saifi * facility_kw * restart_cost
 
-    # No backup scenario
-    no_backup_cost = revenue_per_hr * saidi_hours - grid_savings
+    pq_mult = PQ_MULT[pq_level]
+    eo_mult = EO_MULT[eo_level]
+    cu_mult = CU_MULT[cu_level]
 
-    # Diesel backup scenario
-    diesel_fuel_per_kwh_elec = (diesel_price or 0.07) / DIESEL_EFFICIENCY
-    diesel_fuel_cost = facility_kw * saidi_hours * diesel_fuel_per_kwh_elec
-    diesel_backup_cost = diesel_fuel_cost - grid_savings
+    v_pq = base_duration_loss * (pq_mult - 1.0)
+    v_ext = base_duration_loss * (eo_mult - 1.0)
+    v_cap = base_duration_loss * (cu_mult - 1.0)
 
-    # Natural gas backup scenario
-    natgas_fuel_per_kwh_elec = (natgas_price or 0.04) / NATGAS_EFFICIENCY
-    natgas_fuel_cost = facility_kw * saidi_hours * natgas_fuel_per_kwh_elec
-    natgas_backup_cost = natgas_fuel_cost - grid_savings
+    total_resilience_value = base_duration_loss + v_freq + v_pq + v_ext + v_cap
+    grid_savings = facility_kw * saidi_hours * elec_price
 
-    # SMR breakeven price ($/kWh)
+    no_backup_cost = base_duration_loss - grid_savings
+    diesel_fuel_cost = facility_kw * saidi_hours * (diesel_price / DIESEL_EFFICIENCY)
+    diesel_backup = diesel_fuel_cost - grid_savings
+    natgas_fuel_cost = facility_kw * saidi_hours * (natgas_price / NATGAS_EFFICIENCY)
+    natgas_backup = natgas_fuel_cost - grid_savings
+
     annual_energy = required_mw * 1_000 * 8_760
-    # Resilience premium based on outage cost avoided
-    outage_cost_avoided = max(no_backup_cost, 0)
-    custom_total   = sum(i["value"] for i in custom_items)
-    premium_adj    = outage_cost_avoided * (1 - risk_tolerance / 200)
-    breakeven_kwh  = (elec_price or 0.10) + (premium_adj + custom_total) / annual_energy
-    premium_pct    = ((breakeven_kwh - (elec_price or 0.10)) / (elec_price or 0.10)) * 100
+    custom_total = sum(i["value"] for i in custom_items)
+    premium_adj = total_resilience_value * (1 - risk_tolerance / 200)
+    breakeven_kwh = elec_price + (premium_adj + custom_total) / annual_energy
+    premium_pct = ((breakeven_kwh - elec_price) / elec_price) * 100 if elec_price > 0 else 0
 
     return {
-        "elec_price":       elec_price,
-        "diesel_price":     diesel_price,
-        "natgas_price":     natgas_price,
-        "saidi_hours":      saidi_hours,
-        "no_backup_cost":   no_backup_cost,
-        "diesel_backup":    diesel_backup_cost,
-        "natgas_backup":    natgas_backup_cost,
-        "breakeven_kwh":    breakeven_kwh,
-        "premium_pct":      premium_pct,
-        "custom_total":     custom_total,
-        "grid_savings":     grid_savings,
+        "elec_price": elec_price,
+        "diesel_price": diesel_price,
+        "natgas_price": natgas_price,
+        "saidi_hours": saidi_hours,
+        "saifi": saifi,
+        "no_backup_cost": no_backup_cost,
+        "diesel_backup": diesel_backup,
+        "natgas_backup": natgas_backup,
+        "breakeven_kwh": breakeven_kwh,
+        "premium_pct": premium_pct,
+        "custom_total": custom_total,
+        "grid_savings": grid_savings,
+        "fallback_flags": fallback_flags,
+        "wtp_breakdown": {
+            "Base Duration Loss":       base_duration_loss,
+            "Frequency Cost (V_freq)":  v_freq,
+            "Power Quality (V_pq)":     v_pq,
+            "Extended Outage (V_ext)":  v_ext,
+            "Capacity Urgency (V_cap)": v_cap,
+            "Custom Items":             custom_total,
+        },
     }
 
 # ─────────────────────────────────────────
-# Layout — Government header
+# Header
 # ─────────────────────────────────────────
 if industry == "Government":
     st.subheader("🪖 Government Pricing Model — FBCF-Based Analysis")
     st.caption("Comparison baseline: Fully Burdened Cost of Fuel (FBCF). Grid electricity price excluded.")
-
-# ── Market: State map ────────────────────
 else:
     st.subheader("⚡ Market Pricing Model — EIA Real Data")
-    st.caption(f"Electricity & fuel prices: EIA SEDS {forecast_year} ({sector}). Outage data: EIA-861 2024.")
-
-    # Build choropleth from real EIA electricity prices for selected year
-    map_data = []
-    for abbr in reliability["state"].tolist():
-        p = get_price(sector, STATE_MAP.get(abbr, ""), "Electricity", forecast_year)
-        if p:
-            map_data.append({"state": abbr, "elec_price": round(p, 4)})
-    map_df = pd.DataFrame(map_data)
-
-    left_col, right_col = st.columns([2, 1])
-    with left_col:
-        fig_map = px.choropleth(
-            map_df, locations="state", locationmode="USA-states",
-            color="elec_price", scope="usa",
-            color_continuous_scale="Blues",
-            labels={"elec_price": f"Electricity $/kWh ({forecast_year})"},
-        )
-        fig_map.update_layout(margin=dict(l=0, r=0, t=0, b=0))
-        st.plotly_chart(fig_map, use_container_width=True)
-
-    with right_col:
-        st.markdown(f"**{selected_state_name} ({selected_state_abbr}) — {forecast_year}**")
-        ep = get_price(sector, selected_state_name, "Electricity", forecast_year)
-        dp = get_price(sector, selected_state_name, "Diesel",      forecast_year)
-        np_ = get_price(sector, selected_state_name, "Natural Gas", forecast_year)
-        rel_row = reliability[reliability["state"] == selected_state_abbr]
-        saidi_val = float(rel_row["saidi_hours_with_med"].values[0]) if not rel_row.empty else None
-
-        st.metric("Electricity Price", f"${ep:.4f}/kWh" if ep else "N/A")
-        st.metric("Diesel Price",      f"${dp:.4f}/kWh" if dp else "N/A")
-        st.metric("Natural Gas Price", f"${np_:.4f}/kWh" if np_ else "N/A")
-        st.metric("SAIDI (outage hrs/yr)", f"{saidi_val:.1f} hrs" if saidi_val else "N/A")
+    st.caption(
+        f"Electricity & fuel prices: EIA SEDS {forecast_year} ({sector}). "
+        f"Outage data: EIA-861 2024. Defaults are preloaded for convenience."
+    )
 
 # ─────────────────────────────────────────
 # Custom Cost Items
 # ─────────────────────────────────────────
 st.markdown("---")
 st.subheader("➕ Additional Cost Items")
-st.caption("Manually add cost/benefit factors. Negative = benefit (e.g. CHP savings).")
+st.caption("Positive = added burden. Negative = benefit/savings.")
 
 c1, c2, c3 = st.columns([3, 2, 1])
 with c1:
     new_label = st.text_input("Item Label", placeholder="e.g. CHP Value, Regulatory Compliance")
 with c2:
-    new_value = st.number_input("Annual Value ($)", value=0, step=10_000,
-                                help="Positive=cost, Negative=benefit/savings")
+    new_value = st.number_input("Annual Value ($)", value=0, step=10_000)
 with c3:
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("＋ Add"):
@@ -347,7 +403,8 @@ if st.session_state.custom_items:
     st.markdown("**Current custom items:**")
     for idx, item in enumerate(st.session_state.custom_items):
         a, b, c = st.columns([3, 2, 1])
-        with a: st.write(f"📌 {item['label']}")
+        with a:
+            st.write(f"📌 {item['label']}")
         with b:
             sign = "+" if item["value"] >= 0 else ""
             st.write(f"{sign}${item['value']:,.0f} / year")
@@ -362,7 +419,6 @@ if st.session_state.custom_items:
 st.markdown("---")
 st.subheader("📊 Economic Outcome")
 
-# ── Government Results ────────────────────
 if industry == "Government":
     res = calc_government(
         required_mw, mission_type, deployment_region,
@@ -373,121 +429,58 @@ if industry == "Government":
     advantage = res["net_advantage"]
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Diesel Total (Annual)",    f"${res['diesel_annual']:,.0f}")
-    c2.metric("SMR Total (Annual)",       f"${res['smr_annual']:,.0f}")
-    c3.metric("SMR Net Advantage",        f"${advantage:,.0f}",
+    c1.metric("Diesel Total (Annual)", f"${res['diesel_annual']:,.0f}")
+    c2.metric("SMR Total (Annual)", f"${res['smr_annual']:,.0f}")
+    c3.metric("SMR Net Advantage", f"${advantage:,.0f}",
               delta="SMR Wins ✅" if advantage > 0 else "Diesel Wins ❌")
     c4.metric("Max Acceptable SMR Price", f"${res['max_smr_price_kwh']:.3f}/kWh")
 
-    st.markdown("---")
-    l2, r2 = st.columns(2)
-    with l2:
-        st.markdown("**Diesel Cost Breakdown (Annual)**")
-        bd = res["breakdown"]
-        fig_d = go.Figure(go.Bar(
-            x=list(bd.values()), y=list(bd.keys()), orientation="h",
-            marker_color=["#E63946","#F4A261","#E9C46A","#2A9D8F","#457B9D"],
-            text=[f"${v:,.0f}" for v in bd.values()], textposition="outside"
-        ))
-        fig_d.update_layout(xaxis_title="Annual Cost ($)", margin=dict(l=0,r=80,t=10,b=0), height=300)
-        st.plotly_chart(fig_d, use_container_width=True)
-
-    with r2:
-        st.markdown("**SMR Cost Breakdown (Annual)**")
-        sbd = res["smr_breakdown"]
-        fig_s = go.Figure(go.Bar(
-            x=list(sbd.values()), y=list(sbd.keys()), orientation="h",
-            marker_color=["#1D3557","#457B9D","#A8DADC","#F1FAEE"],
-            text=[f"${v:,.0f}" for v in sbd.values()], textposition="outside"
-        ))
-        fig_s.update_layout(xaxis_title="Annual Cost ($)", margin=dict(l=0,r=80,t=10,b=0), height=300)
-        st.plotly_chart(fig_s, use_container_width=True)
-
-    st.markdown("**Cost Comparison: Diesel vs SMR**")
-    fig_cmp = go.Figure(go.Bar(
-        x=["Diesel (FBCF Total)", "SMR (Lifecycle Total)"],
-        y=[res["diesel_annual"], res["smr_annual"]],
-        marker_color=["#E63946", "#2A9D8F"],
-        text=[f"${res['diesel_annual']:,.0f}", f"${res['smr_annual']:,.0f}"],
-        textposition="outside"
-    ))
-    fig_cmp.update_layout(yaxis_title="Annual Cost ($)", margin=dict(l=0,r=0,t=10,b=0), height=350)
-    st.plotly_chart(fig_cmp, use_container_width=True)
-
-    st.subheader("Decision Summary")
-    status = "✅ SMR IS ECONOMICALLY JUSTIFIED" if advantage > 0 else "⚠️ REQUIRES STRATEGIC JUSTIFICATION"
-    st.text(
-        f"Under {mission_type} conditions in the {deployment_region} region,\n"
-        f"a {required_mw} MW eVinci deployment over {operation_years} years\n"
-        f"shows an estimated annual diesel burden of ${res['diesel_annual']:,.0f} "
-        f"vs. SMR annual cost of ${res['smr_annual']:,.0f}."
-    )
-    st.text(f"Max price Westinghouse can charge: ${res['max_smr_price_kwh']:.3f}/kWh.")
-    st.markdown(f"### {status}")
-
-# ── Market Results ────────────────────────
 else:
     res = calc_market(
         required_mw, selected_state_abbr, sector, forecast_year,
         saidi_variant, facility_kw, revenue_per_hr,
-        risk_tolerance, st.session_state.custom_items
+        risk_tolerance, pq_level, eo_level, cu_level,
+        st.session_state.custom_items
     )
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Grid Electricity Price",  f"${res['elec_price']:.4f}/kWh" if res['elec_price'] else "N/A")
-    c2.metric("SMR Breakeven Price",     f"${res['breakeven_kwh']:.4f}/kWh")
-    c3.metric("Justifiable Premium",     f"{res['premium_pct']:.1f}%")
-    c4.metric("Annual Outage (hrs)",     f"{res['saidi_hours']:.1f} hrs")
+    if res["fallback_flags"]:
+        st.warning(
+            "Some requested inputs were unavailable in the uploaded data, so fallback assumptions were used:\n\n- "
+            + "\n- ".join(res["fallback_flags"])
+        )
+    else:
+        st.info("All core price and reliability inputs were pulled from the uploaded EIA-based datasets.")
 
-    # 4-scenario comparison bar chart
-    st.markdown("**Annual Outage Cost by Backup Scenario**")
-    scenario_df = pd.DataFrame({
-        "Scenario":     ["No Backup", "Diesel Generator", "Natural Gas Generator", "SMR (eVinci)"],
-        "Annual Cost":  [
-            max(res["no_backup_cost"], 0),
-            max(res["diesel_backup"], 0),
-            max(res["natgas_backup"], 0),
-            0,   # SMR = 0 outage cost (continuous power)
-        ],
-        "Color": ["#E63946", "#F4A261", "#E9C46A", "#2A9D8F"]
-    })
-    fig_sc = go.Figure(go.Bar(
-        x=scenario_df["Scenario"], y=scenario_df["Annual Cost"],
-        marker_color=scenario_df["Color"],
-        text=[f"${v:,.0f}" for v in scenario_df["Annual Cost"]],
-        textposition="outside"
-    ))
-    fig_sc.update_layout(yaxis_title="Annual Outage Cost ($)",
-                          margin=dict(l=0,r=0,t=10,b=0), height=350)
-    st.plotly_chart(fig_sc, use_container_width=True)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Grid Electricity Price", f"${res['elec_price']:.4f}/kWh")
+    c2.metric("SMR Breakeven Price", f"${res['breakeven_kwh']:.4f}/kWh")
+    c3.metric("Justifiable Premium", f"{res['premium_pct']:.1f}%")
+    c4.metric("SAIDI (hrs/yr)", f"{res['saidi_hours']:.1f} hrs")
+    c5.metric("SAIFI (events/yr)", f"{res['saifi']:.2f}")
 
-    # Price trend chart (2024–2038)
-    st.markdown("**Electricity Price Forecast: 2024–2038 (EIA + Prophet)**")
-    years      = list(range(2024, 2039))
-    price_hist = [get_price(sector, selected_state_name, "Electricity", y) for y in years]
-    fig_trend  = go.Figure()
-    fig_trend.add_trace(go.Scatter(
-        x=years, y=price_hist, mode="lines+markers",
-        name="Electricity Price", line=dict(color="#457B9D", width=2)
-    ))
-    fig_trend.add_vline(x=2024.5, line_dash="dash", line_color="gray",
-                         annotation_text="Forecast →")
-    fig_trend.update_layout(
-        xaxis_title="Year", yaxis_title="$/kWh",
-        margin=dict(l=0,r=0,t=10,b=0), height=300
+    st.markdown("**WTP Breakdown — Resilience Value Components**")
+    st.caption(
+        "Revenue loss per outage hour is a user-provided facility parameter. "
+        "Defaults are placeholders for convenience; replace them with site-specific estimates when available. "
+        "Advanced multipliers are conservative scenario calibrations anchored in public literature."
     )
-    st.plotly_chart(fig_trend, use_container_width=True)
 
-    # Decision Summary
+    wtp = res["wtp_breakdown"]
+    fig_wtp = go.Figure(go.Bar(
+        x=list(wtp.values()), y=list(wtp.keys()), orientation="h",
+        text=[f"${v:,.0f}" for v in wtp.values()], textposition="outside"
+    ))
+    fig_wtp.update_layout(xaxis_title="Annual Value ($)", margin=dict(l=0, r=80, t=10, b=0), height=320)
+    st.plotly_chart(fig_wtp, use_container_width=True)
+
     st.subheader("Decision Summary")
-    is_viable = res["premium_pct"] <= 20
-    status    = "✅ ECONOMICALLY DEFENSIBLE" if is_viable else "⚠️ REQUIRES STRATEGIC JUSTIFICATION"
+    total_wtp = sum(res["wtp_breakdown"].values())
     st.text(
         f"In {selected_state_name} ({sector} sector, {forecast_year}),\n"
-        f"grid electricity costs ${res['elec_price']:.4f}/kWh "
-        f"with {res['saidi_hours']:.1f} annual outage hours (SAIDI).\n"
-        f"Annual outage cost without backup: ${max(res['no_backup_cost'],0):,.0f}.\n"
+        f"grid electricity costs ${res['elec_price']:.4f}/kWh with {res['saidi_hours']:.1f} outage hrs/yr "
+        f"and {res['saifi']:.2f} interruptions/yr.\n"
+        f"Using a user-provided outage loss assumption of ${revenue_per_hr:,.0f}/hr,\n"
+        f"total resilience value is estimated at ${total_wtp:,.0f}/yr.\n"
         f"SMR breakeven price: ${res['breakeven_kwh']:.4f}/kWh "
         f"({res['premium_pct']:.1f}% above grid rate)."
     )
-    st.markdown(f"### {status}")
