@@ -60,23 +60,20 @@ def load_reliability():
     if not os.path.exists(path):
         path = "/mnt/user-data/uploads/Reliability_2024.xlsx"
     df = pd.read_excel(path, sheet_name="State Totals", header=None)
-    # Row 2 = headers, rows 3+ = data
-    data = df.iloc[3:].copy()
-    data.columns = df.iloc[2].tolist()
-    data = data.dropna(subset=["State"])
-    # Col 3 = SAIDI With MED (minutes/year), Col 6 = SAIDI Without MED
-    data = data.rename(columns={
-        data.columns[1]: "state",
-        data.columns[3]: "saidi_with_med",
-        data.columns[6]: "saidi_without_med",
+    # Rows 0-2 = multi-row header, rows 3+ = data
+    # Use iloc to extract columns directly — avoids duplicate column name issues
+    # Col 1 = State abbr, Col 3 = SAIDI With MED (min/yr), Col 6 = SAIDI Without MED (min/yr)
+    raw = df.iloc[3:].copy()
+    raw = raw.dropna(subset=[1])  # drop footer rows
+
+    result = pd.DataFrame({
+        "state":               raw.iloc[:, 1].astype(str).str.strip(),
+        "saidi_with_med":      pd.to_numeric(raw.iloc[:, 3], errors="coerce"),
+        "saidi_without_med":   pd.to_numeric(raw.iloc[:, 6], errors="coerce"),
     })
-    data["state"] = data["state"].astype(str).str.strip()
-    data["saidi_with_med"]    = pd.to_numeric(data["saidi_with_med"], errors="coerce")
-    data["saidi_without_med"] = pd.to_numeric(data["saidi_without_med"], errors="coerce")
-    # Convert minutes → hours
-    data["saidi_hours_with_med"]    = data["saidi_with_med"] / 60
-    data["saidi_hours_without_med"] = data["saidi_without_med"] / 60
-    return data[["state", "saidi_hours_with_med", "saidi_hours_without_med"]].reset_index(drop=True)
+    result["saidi_hours_with_med"]    = result["saidi_with_med"] / 60
+    result["saidi_hours_without_med"] = result["saidi_without_med"] / 60
+    return result[["state", "saidi_hours_with_med", "saidi_hours_without_med"]].reset_index(drop=True)
 
 fuel_sheets   = load_fuel_prices()
 reliability   = load_reliability()
