@@ -99,6 +99,12 @@ def get_price(sector, state, fuel, year):
     col = str(year)
     return float(row[col].values[0]) if col in row.columns else None
 
+
+def get_avg_price_over_years(sector, state, fuel, years):
+    prices = [get_price(sector, state, fuel, y) for y in years]
+    prices = [p for p in prices if p is not None]
+    return float(np.mean(prices)) if prices else None
+
 def get_state_full_names():
     STATE_MAP = {
         "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California",
@@ -160,6 +166,10 @@ if industry == "Government":
     security_level = st.sidebar.slider("Security Level (%)", 0, 100, 30)
     risk_tolerance = st.sidebar.slider("Risk Tolerance (%)", 0, 100, 50)
     operation_years = st.sidebar.slider("Operation Duration (years)", 3, 20, 10)
+    deployment_start_year = st.sidebar.slider(
+        "Deployment Start Year", 2024, 2038, 2025,
+        help="Used to average forecast diesel prices over the selected operating window."
+    )
     contract_type = st.sidebar.selectbox(
         "Contract Type (LCOE Stage)",
         list(CAPEX_PER_MW.keys()), index=1,
@@ -230,9 +240,38 @@ else:
 # ─────────────────────────────────────────
 def calc_government(required_mw, mission_type, deployment_region,
                     force_size, convoys_per_year, security_level,
-                    risk_tolerance, operation_years, contract_type, custom_items):
+                    risk_tolerance, operation_years, deployment_start_year,
+                    contract_type, custom_items):
 
-    fbcf_annual         = convoys_per_year * FBCF_PER_CONVOY_FIXED[mission_type]
+    fallback_flags = []
+    end_year = min(deployment_start_year + operation_years - 1, 2038)
+    operating_years = list(range(deployment_start_year, end_year + 1))
+    actual_years_used = len(operating_years)
+
+    # Use forecasted diesel prices to adjust the fuel-related portion of the FBCF.
+    # We keep the military logistics burden concept intact and scale it by relative fuel price movement.
+    region_to_state = {
+        "Middle East": "Texas",
+        "Pacific Island": "Hawaii",
+        "Europe": "Virginia",
+        "Domestic": "Pennsylvania",
+    }
+    diesel_reference_state = region_to_state.get(deployment_region, "Texas")
+    base_year = 2025
+    base_diesel_price = get_price("Commercial", diesel_reference_state, "Diesel", base_year)
+    avg_diesel_price = get_avg_price_over_years("Commercial", diesel_reference_state, "Diesel", operating_years)
+
+    if base_diesel_price is None or base_diesel_price <= 0:
+        base_diesel_price = 0.07
+        fallback_flags.append("Government diesel base price fallback applied ($0.07/kWh-th in 2025 equivalent).")
+    if avg_diesel_price is None or avg_diesel_price <= 0:
+        avg_diesel_price = base_diesel_price
+        fallback_flags.append("Government diesel forecast fallback applied; using base-year diesel price.")
+
+    diesel_escalation_factor = avg_diesel_price / base_diesel_price if base_diesel_price > 0 else 1.0
+    adjusted_fbcf_per_convoy = FBCF_PER_CONVOY_FIXED[mission_type] * diesel_escalation_factor
+    fbcf_annual = convoys_per_year * adjusted_fbcf_per_convoy
+
     expected_casualties = min(convoys_per_year * CASUALTY_RATE, MAX_CASUALTIES_PER_YEAR)
     blood_cost_annual   = expected_casualties * VSL
     base_disruption     = 2_000_000 * required_mw
@@ -254,23 +293,37 @@ def calc_government(required_mw, mission_type, deployment_region,
     decom       = DECOM_PER_MW * required_mw
     smr_annual  = (capex + decom) / operation_years + opex_annual + security_cost_annual
 
-    custom_total  = sum(i["value"] for i in custom_items)
-    diesel_annual = fbcf_annual + blood_cost_annual + mission_assurance + force_realloc
-    net_advantage = (diesel_annual + custom_total) - smr_annual
-    annual_kwh    = required_mw * 1_000 * 8_760
-    max_price_kwh = (diesel_annual + custom_total) / annual_kwh if annual_kwh > 0 else 0
+    custom_total      = sum(i["value"] for i in custom_items)
+    diesel_annual     = fbcf_annual + blood_cost_annual + mission_assurance + force_realloc
+    diesel_lifecycle  = (diesel_annual + custom_total) * actual_years_used
+    smr_lifecycle     = smr_annual * actual_years_used
+    net_advantage     = (diesel_annual + custom_total) - smr_annual
+    lifecycle_adv     = diesel_lifecycle - smr_lifecycle
+    annual_kwh        = required_mw * 1_000 * 8_760
+    max_price_kwh     = (diesel_annual + custom_total) / annual_kwh if annual_kwh > 0 else 0
 
     return {
         "diesel_annual": diesel_annual,
+        "diesel_lifecycle": diesel_lifecycle,
         "smr_annual": smr_annual,
+        "smr_lifecycle": smr_lifecycle,
         "net_advantage": net_advantage,
+        "lifecycle_advantage": lifecycle_adv,
         "max_smr_price_kwh": max_price_kwh,
+        "deployment_start_year": deployment_start_year,
+        "deployment_end_year": end_year,
+        "years_used": actual_years_used,
+        "diesel_reference_state": diesel_reference_state,
+        "base_diesel_price": base_diesel_price,
+        "avg_diesel_price": avg_diesel_price,
+        "diesel_escalation_factor": diesel_escalation_factor,
+        "fallback_flags": fallback_flags,
         "breakdown": {
-            "FBCF (Fuel Logistics)":     fbcf_annual,
-            "Casualty Avoidance":        blood_cost_annual,
-            "Mission Assurance Premium": mission_assurance,
-            "Force Reallocation":        force_realloc,
-            "Custom Items":              custom_total,
+            "FBCF (Fuel Logistics, adj.)": adjusted_fbcf_per_convoy * convoys_per_year,
+            "Casualty Avoidance":          blood_cost_annual,
+            "Mission Assurance Premium":   mission_assurance,
+            "Force Reallocation":          force_realloc,
+            "Custom Items":                custom_total,
         },
         "smr_breakdown": {
             "CAPEX (annualized)":           capex / operation_years,
@@ -423,17 +476,41 @@ if industry == "Government":
     res = calc_government(
         required_mw, mission_type, deployment_region,
         force_size, convoys_per_year, security_level,
-        risk_tolerance, operation_years, contract_type,
-        st.session_state.custom_items
+        risk_tolerance, operation_years, deployment_start_year,
+        contract_type, st.session_state.custom_items
     )
     advantage = res["net_advantage"]
+    lifecycle_advantage = res["lifecycle_advantage"]
+
+    if res["fallback_flags"]:
+        st.warning(
+            "Some requested government fuel inputs were unavailable in the uploaded data, so fallback assumptions were used:\n\n- "
+            + "\n- ".join(res["fallback_flags"])
+        )
+    else:
+        st.info(
+            f"Government diesel/FBCF adjustment uses forecast diesel prices averaged from {res['deployment_start_year']} to {res['deployment_end_year']} "
+            f"({res['diesel_reference_state']} proxy state)."
+        )
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Diesel Total (Annual)", f"${res['diesel_annual']:,.0f}")
-    c2.metric("SMR Total (Annual)", f"${res['smr_annual']:,.0f}")
-    c3.metric("SMR Net Advantage", f"${advantage:,.0f}",
+    c2.metric("Diesel Total (Lifecycle)", f"${res['diesel_lifecycle']:,.0f}")
+    c3.metric("SMR Total (Annual)", f"${res['smr_annual']:,.0f}")
+    c4.metric("SMR Total (Lifecycle)", f"${res['smr_lifecycle']:,.0f}")
+
+    c5, c6, c7 = st.columns(3)
+    c5.metric("SMR Net Advantage (Annual)", f"${advantage:,.0f}",
               delta="SMR Wins ✅" if advantage > 0 else "Diesel Wins ❌")
-    c4.metric("Max Acceptable SMR Price", f"${res['max_smr_price_kwh']:.3f}/kWh")
+    c6.metric("SMR Net Advantage (Lifecycle)", f"${lifecycle_advantage:,.0f}",
+              delta="SMR Wins ✅" if lifecycle_advantage > 0 else "Diesel Wins ❌")
+    c7.metric("Max Acceptable SMR Price", f"${res['max_smr_price_kwh']:.3f}/kWh")
+
+    st.caption(
+        f"Lifecycle window: {res['deployment_start_year']}–{res['deployment_end_year']} ({res['years_used']} years used). "
+        f"Avg diesel price proxy = ${res['avg_diesel_price']:.4f}/kWh-th vs. base ${res['base_diesel_price']:.4f}/kWh-th "
+        f"(FBCF escalation factor {res['diesel_escalation_factor']:.2f}x)."
+    )
 
 else:
     res = calc_market(
